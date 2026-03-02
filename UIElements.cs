@@ -1,8 +1,9 @@
-﻿global using static UIElements;
+﻿global using static UIElements;//чёрная магия, запрет!
 using System;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
+
 
 public class UIElements : MonoBehaviour
 {
@@ -12,5 +13,6 @@ public class UIElements : MonoBehaviour
 
 public static class StaticTypedEventBuss
 {
+    
 }
 

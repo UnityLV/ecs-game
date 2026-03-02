@@ -1,13 +1,184 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
 using Leopotam.EcsLite;
+using Newtonsoft.Json;
+using UnityEditor.Experimental.GraphView;
 using UnityEngine;
 using Object = UnityEngine.Object;
 using Random = System.Random;
 
+//система сохранения и загрузки, модель в ecs синкается с юнити
+//система асинхронной загрузки ассетов, моделей для игрока и патронов и препятсвий
 
-public class GameObjectCleanUpSystem : IEcsDestroySystem
+[Serializable]
+public struct SVector3
 {
+    public float x;
+    public float y;
+    public float z;
+
+    public SVector3(float vector3X, float vector3Y, float vector3Z)
+    {
+        x = vector3X;
+        y = vector3Y;
+        z = vector3Z;
+    }
+
+    public static implicit operator Vector3(SVector3 vector3)
+    {
+        return new Vector3(vector3.x, vector3.y, vector3.z);
+    }
+
+    public static implicit operator SVector3(Vector3 vector3)
+    {
+        return new SVector3(vector3.x, vector3.y, vector3.z);
+    }
+}
+
+
+public class SaveSystem : IEcsInitSystem, IEcsDestroySystem
+{
+    string bulletPositionsKey = "bulletPositions";
+    string bulletVelocityKey = "bulletVelocity";
+
+    public void Init(IEcsSystems systems)
+    {
+        Debug.Log("SaveSystem: Init - Начинаем восстановление пуль");
+        Restore(systems);
+        Debug.Log("SaveSystem: Init - Восстановление завершено");
+    }
+
     public void Destroy(IEcsSystems systems)
+    {
+        Debug.Log("SaveSystem: Destroy - Начинаем сохранение пуль");
+        Save(systems);
+        Debug.Log("SaveSystem: Destroy - Сохранение завершено");
+    }
+
+    public void Restore(IEcsSystems systems)
+    {
+        if (PlayerPrefs.HasKey(bulletPositionsKey) == false)
+        {
+            Debug.Log("SaveSystem: Restore - Ключи не найдены, пропускаем восстановление");
+            return;
+        }
+
+        string positionsJson = PlayerPrefs.GetString(bulletPositionsKey);
+        string velocityJson = PlayerPrefs.GetString(bulletVelocityKey);
+        
+        List<SVector3> bulletPositions;
+        List<SVector3> bulletVelocity;
+
+        try
+        {
+            bulletPositions = JsonConvert.DeserializeObject<List<SVector3>>(positionsJson);
+            bulletVelocity = JsonConvert.DeserializeObject<List<SVector3>>(velocityJson);
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"SaveSystem: Restore - Ошибка десериализации JSON: {e.Message}");
+            return;
+        }
+
+        if (bulletPositions == null || bulletVelocity == null || bulletPositions.Count != bulletVelocity.Count)
+        {
+            Debug.LogError("SaveSystem: Restore - Несоответствие данных или null списки");
+            return;
+        }
+
+        var positionPool = systems.GetWorld().GetPool<Position>();
+        var velocityPool = systems.GetWorld().GetPool<Velocity>();
+        var bulletTagPool = systems.GetWorld().GetPool<BulletTag>();
+
+
+        for (int i = 0; i < bulletPositions.Count; i++)
+        {
+            try
+            {
+                var newEntity = systems.GetWorld().NewEntity();
+                positionPool.Add(newEntity).position = bulletPositions[i];
+                velocityPool.Add(newEntity).direction = bulletVelocity[i];
+                bulletTagPool.Add(newEntity);
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogError($"SaveSystem: Restore - Ошибка создания пули {i}: {e.Message}");
+            }
+        }
+
+    }
+
+    public void Save(IEcsSystems systems)
+    {
+        List<SVector3> bulletPositions = new();
+        List<SVector3> bulletVelocity = new();
+
+        var bulletFilter = systems.GetWorld().Filter<BulletTag>().Inc<Position>().Inc<Velocity>().End();
+
+        var positionPool = systems.GetWorld().GetPool<Position>();
+        var velocityPool = systems.GetWorld().GetPool<Velocity>();
+
+        int index = 0;
+        foreach (var bullet in bulletFilter)
+        {
+            try
+            {
+                var position = positionPool.Get(bullet).position;
+                var velocity = velocityPool.Get(bullet).direction;
+
+                bulletPositions.Add(position);
+                bulletVelocity.Add(velocity);
+
+                index++;
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogError($"SaveSystem: Save - Ошибка получения данных пули {bullet}: {e.Message}");
+            }
+        }
+        
+        try
+        {
+            string positionsJson = JsonConvert.SerializeObject(bulletPositions);
+            string velocityJson = JsonConvert.SerializeObject(bulletVelocity);
+            
+            PlayerPrefs.SetString(bulletPositionsKey, positionsJson);
+            PlayerPrefs.SetString(bulletVelocityKey, velocityJson);
+            PlayerPrefs.Save(); // Принудительное сохранение
+
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"SaveSystem: Save - Ошибка сериализации/сохранения: {e.Message}");
+        }
+    }
+}
+
+
+public class SyncPositionWithUnitySystem : IEcsRunSystem
+{
+    public void Run(IEcsSystems systems)
+    {
+        var toSyncFilter = systems.GetWorld().Filter<GameObjectRef>().Inc<Position>().End();
+
+        var gameObjectPool = systems.GetWorld().GetPool<GameObjectRef>();
+        var positionPool = systems.GetWorld().GetPool<Position>();
+
+        foreach (var tySync in toSyncFilter)
+        {
+            var go = gameObjectPool.Get(tySync).GO;
+            var position = positionPool.Get(tySync).position;
+            go.transform.position = position;
+        }
+    }
+}
+
+
+public class GameObjectCleanUpSystem : IEcsPostDestroySystem
+{
+    public void PostDestroy(IEcsSystems systems)
     {
         var GameObjects = systems.GetWorld().Filter<GameObjectRef>().Inc<DestroyOnExitTag>().End();
         var gameObjectPool = systems.GetWorld().GetPool<GameObjectRef>();
@@ -20,7 +191,6 @@ public class GameObjectCleanUpSystem : IEcsDestroySystem
     }
 }
 
-
 public class PlayerWinSystem : IEcsRunSystem
 {
     public void Run(IEcsSystems systems)
@@ -29,9 +199,9 @@ public class PlayerWinSystem : IEcsRunSystem
         if (shared.points >= shared.target)
         {
             shared.isWon = true;
-            foreach (var player in systems.GetWorld().Filter<PlayerTag>().Inc<GameObjectRef>().End())
+            foreach (var player in systems.GetWorld().Filter<PlayerTag>().Inc<Position>().End())
             {
-                var playerPos = systems.GetWorld().GetPool<GameObjectRef>().Get(player).GO.transform.position;
+                var playerPos = systems.GetWorld().GetPool<Position>().Get(player).position;
                 shared.savedPlayerXPosition = playerPos.x;
             }
         }
@@ -39,13 +209,11 @@ public class PlayerWinSystem : IEcsRunSystem
 }
 
 
-public class DisplaySystem : IEcsRunSystem,IEcsInitSystem
+public class DisplaySystem : IEcsRunSystem, IEcsInitSystem
 {
     public void Run(IEcsSystems systems)
     {
         var pointsUpdateEventFilter = systems.GetWorld().Filter<PointsUpdateEvent>().End();
-
-        var pointsUpdateEventPool = systems.GetWorld().GetPool<PointsUpdateEvent>();
 
         foreach (var pointsUpdate in pointsUpdateEventFilter)
         {
@@ -89,7 +257,6 @@ public class PointsEarnSystem : IEcsRunSystem, IEcsInitSystem
         if (playerDeadEventFilter.GetEntitiesCount() > 0)
         {
             systems.GetShared<SharedData>().points = 0;
-
             updated = true;
         }
 
@@ -109,12 +276,11 @@ public class PlayerDeadByObstacleSystem : IEcsRunSystem
 {
     public void Run(IEcsSystems systems)
     {
-        var playerFiler = systems.GetWorld().Filter<PlayerTag>().Inc<GameObjectRef>().End();
-        var obstacleFilter = systems.GetWorld().Filter<ObstacleTag>().Inc<GameObjectRef>().End();
+        var playerFiler = systems.GetWorld().Filter<PlayerTag>().Inc<Position>().End();
+        var obstacleFilter = systems.GetWorld().Filter<ObstacleTag>().Inc<Position>().End();
         var lifeTimeFilter = systems.GetWorld().Filter<GameObjectLifeTime>().End();
 
-        var gameObjectPool = systems.GetWorld().GetPool<GameObjectRef>();
-        var pointsUpdateEventPool = systems.GetWorld().GetPool<PointsUpdateEvent>();
+        var positionPool = systems.GetWorld().GetPool<Position>();
         var lifeTimePool = systems.GetWorld().GetPool<GameObjectLifeTime>();
 
         var playerDeadEventFIlter = systems.GetWorld().Filter<PlayerDeadEvent>().End();
@@ -126,11 +292,11 @@ public class PlayerDeadByObstacleSystem : IEcsRunSystem
 
         foreach (var player in playerFiler)
         {
-            var playerPosition = gameObjectPool.Get(player).GO.transform.position;
+            var playerPosition = positionPool.Get(player).position;
             foreach (var obstacle in obstacleFilter)
             {
-                var obstaclePosition = gameObjectPool.Get(obstacle).GO.transform.position;
-                if (Vector3.Distance(playerPosition, obstaclePosition) < 1)
+                var obstaclePosition = positionPool.Get(obstacle).position;
+                if (Vector3.SqrMagnitude(playerPosition - obstaclePosition) < 1)
                 {
                     //dead
 
@@ -140,6 +306,7 @@ public class PlayerDeadByObstacleSystem : IEcsRunSystem
                         lifeTimePool.Get(lifeTime).deadTime = 0;
                     }
 
+//points = 0
                     playerDeadEventPool.Add(systems.GetWorld().NewEntity());
                 }
             }
@@ -151,11 +318,11 @@ public class BulletDestoryObstacleSystem : IEcsRunSystem
 {
     public void Run(IEcsSystems systems)
     {
-        var bulletFilter = systems.GetWorld().Filter<BulletTag>().Inc<GameObjectRef>().End();
-        var obstacleFilter = systems.GetWorld().Filter<ObstacleTag>().Inc<GameObjectRef>().End();
+        var bulletFilter = systems.GetWorld().Filter<BulletTag>().Inc<Position>().End();
+        var obstacleFilter = systems.GetWorld().Filter<ObstacleTag>().Inc<Position>().End();
         var obstalceDesotoryEventFilter = systems.GetWorld().Filter<ObstacleDestroyEvent>().End();
 
-        var gameObjectPool = systems.GetWorld().GetPool<GameObjectRef>();
+        var positionPool = systems.GetWorld().GetPool<Position>();
         var obstalceDestoryEventPool = systems.GetWorld().GetPool<ObstacleDestroyEvent>();
 
         var lifeTimePool = systems.GetWorld().GetPool<GameObjectLifeTime>();
@@ -167,10 +334,10 @@ public class BulletDestoryObstacleSystem : IEcsRunSystem
 
         foreach (var bullet in bulletFilter)
         {
-            var bulletPosition = gameObjectPool.Get(bullet).GO.transform.position;
+            var bulletPosition = positionPool.Get(bullet).position;
             foreach (var obstacle in obstacleFilter)
             {
-                var obstaclePosition = gameObjectPool.Get(obstacle).GO.transform.position;
+                var obstaclePosition = positionPool.Get(obstacle).position;
                 if (Vector3.Distance(bulletPosition, obstaclePosition) < 1)
                 {
                     //destory obstacle and bullet
@@ -206,15 +373,16 @@ public class ObstacleSpawnSystem : IEcsRunSystem
             var lifeTimePool = systems.GetWorld().GetPool<GameObjectLifeTime>();
             var obstaclePool = systems.GetWorld().GetPool<ObstacleTag>();
             var destroyOnExitPool = systems.GetWorld().GetPool<DestroyOnExitTag>();
+            var positionPool = systems.GetWorld().GetPool<Position>();
 
             float xPos = (Mathf.PerlinNoise1D(time) - 0.5f) * 20;
-            (gameObjectPool.Add(obstacleEntity).GO = GameObject.CreatePrimitive(PrimitiveType.Cube))
-                .transform.position = new Vector3(xPos, 0, 30);
+            gameObjectPool.Add(obstacleEntity).GO = GameObject.CreatePrimitive(PrimitiveType.Cube);
 
             velocityPool.Add(obstacleEntity).direction = new Vector3(0, 0, -10);
             lifeTimePool.Add(obstacleEntity).deadTime = Time.time + 5;
             obstaclePool.Add(obstacleEntity);
             destroyOnExitPool.Add(obstacleEntity);
+            positionPool.Add(obstacleEntity).position = new Vector3(xPos, 0, 30);
         }
     }
 }
@@ -262,30 +430,33 @@ public class FollowPlayerSystem : IEcsRunSystem, IEcsInitSystem
         var gameobjectPool = systems.GetWorld().GetPool<GameObjectRef>();
         var cameraFollowPool = systems.GetWorld().GetPool<FollowPlayer>();
         var lookAtPlayerPool = systems.GetWorld().GetPool<LookAtPlayer>();
+        var positionPool = systems.GetWorld().GetPool<Position>();
 
         var mainCameraEntity = systems.GetWorld().NewEntity();
         gameobjectPool.Add(mainCameraEntity).GO = Camera.main.gameObject;
         cameraFollowPool.Add(mainCameraEntity).offset = new Vector3(0, 2, -5);
         lookAtPlayerPool.Add(mainCameraEntity);
+        positionPool.Add(mainCameraEntity);
     }
 
     public void Run(IEcsSystems systems)
     {
         var playerGo = systems.GetWorld().Filter<PlayerTag>().Inc<GameObjectRef>().End();
-        var followGo = systems.GetWorld().Filter<FollowPlayer.Trigger>().Inc<GameObjectRef>().End();
+        var followGo = systems.GetWorld().Filter<FollowPlayer.Trigger>().Inc<Position>().End();
 
         var gameObjectPool = systems.GetWorld().GetPool<GameObjectRef>();
+        var positionPool = systems.GetWorld().GetPool<Position>();
         var playerFollowPool = systems.GetWorld().GetPool<FollowPlayer.Trigger>();
         foreach (var player in playerGo)
         {
             foreach (var follow in followGo)
             {
-                var playerTransform = gameObjectPool.Get(player).GO.transform;
+                var playerLocalToWorldMatrix = gameObjectPool.Get(player).GO.transform.localToWorldMatrix;
 
                 Vector3 offset = playerFollowPool.Get(follow).offset;
-                Vector4 pos = playerTransform.localToWorldMatrix * new Vector4(offset.x, offset.y, offset.z, 1);
+                Vector4 pos = playerLocalToWorldMatrix * new Vector4(offset.x, offset.y, offset.z, 1);
 
-                gameObjectPool.Get(follow).GO.transform.position = pos;
+                positionPool.Get(follow).position = pos;
             }
         }
     }
@@ -312,28 +483,43 @@ public class GameObjectLifeTimeSystem : IEcsRunSystem
     }
 }
 
+public class BulletInitSystem : IEcsRunSystem
+{
+    public void Run(IEcsSystems systems)
+    {
+        var toInitFilter = systems.GetWorld().Filter<BulletTag>().Inc<Position>().Inc<Velocity>().Exc<GameObjectRef>()
+            .End();
+
+        var gameObjectPool = systems.GetWorld().GetPool<GameObjectRef>();
+        var lifeTimePool = systems.GetWorld().GetPool<GameObjectLifeTime>();
+        var destroyOnExitPool = systems.GetWorld().GetPool<DestroyOnExitTag>();
+
+        foreach (var toInit in toInitFilter)
+        {
+            gameObjectPool.Add(toInit).GO = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            lifeTimePool.Add(toInit).deadTime = Time.time + 10;
+            destroyOnExitPool.Add(toInit);
+        }
+    }
+}
+
 
 public class FireSystem : IEcsRunSystem
 {
     public void Run(IEcsSystems systems)
     {
-        var firePlayer = systems.GetWorld().Filter<PlayerTag>().Inc<GameObjectRef>().Inc<FireEvent>().End();
+        var firePlayer = systems.GetWorld().Filter<PlayerTag>().Inc<Position>().Inc<FireEvent>().End();
         var bulletPool = systems.GetWorld().GetPool<BulletTag>();
         var velocityPool = systems.GetWorld().GetPool<Velocity>();
+        var positionPool = systems.GetWorld().GetPool<Position>();
         var gameObjectPool = systems.GetWorld().GetPool<GameObjectRef>();
-        var lifeTimePool = systems.GetWorld().GetPool<GameObjectLifeTime>();
-        var destroyOnExitPool = systems.GetWorld().GetPool<DestroyOnExitTag>();
 
         foreach (var player in firePlayer)
         {
             var bullet = systems.GetWorld().NewEntity();
             bulletPool.Add(bullet);
-            velocityPool.Add(bullet).direction = gameObjectPool.Get(player).GO.transform.forward * 50;
-            var bulletGo = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            bulletGo.transform.position = gameObjectPool.Get(player).GO.transform.position;
-            gameObjectPool.Add(bullet).GO = bulletGo;
-            lifeTimePool.Add(bullet).deadTime = Time.time + 1;
-            destroyOnExitPool.Add(bullet);
+            velocityPool.Add(bullet).direction = gameObjectPool.Get(player).GO.transform.forward * 10;
+            positionPool.Add(bullet).position = positionPool.Get(player).position;
         }
     }
 }
@@ -356,13 +542,13 @@ public class MovementSystem : IEcsRunSystem
 {
     public void Run(IEcsSystems systems)
     {
-        var movable = systems.GetWorld().Filter<GameObjectRef>().Inc<MoveDirection>().End();
-        var goPool = systems.GetWorld().GetPool<GameObjectRef>();
+        var movable = systems.GetWorld().Filter<Position>().Inc<MoveDirection>().End();
+        var positionPool = systems.GetWorld().GetPool<Position>();
         var movePool = systems.GetWorld().GetPool<MoveDirection>();
         float dt = Time.deltaTime;
         foreach (var movabl in movable)
         {
-            goPool.Get(movabl).GO.transform.Translate(movePool.Get(movabl).direction * dt);
+            positionPool.Get(movabl).position += movePool.Get(movabl).direction * dt;
             movePool.Del(movabl);
         }
     }
@@ -373,8 +559,8 @@ public class InputSystem : IEcsRunSystem, IEcsInitSystem
 {
     public void Run(IEcsSystems systems)
     {
-        var playersFilter = systems.GetWorld().Filter<PlayerTag>().Inc<GameObjectRef>().End();
-        var followPlayerFilter = systems.GetWorld().Filter<FollowPlayer>().Inc<GameObjectRef>().End();
+        var playersFilter = systems.GetWorld().Filter<PlayerTag>().Inc<Position>().End();
+        var followPlayerFilter = systems.GetWorld().Filter<FollowPlayer>().Inc<Position>().End();
 
         var movePool = systems.GetWorld().GetPool<MoveDirection>();
         var rotateAnglePool = systems.GetWorld().GetPool<RotateAngle>();
@@ -458,6 +644,7 @@ public class PlayerInitSystem : IEcsRunSystem, IEcsInitSystem
         var playersFilter = systems.GetWorld().Filter<PlayerTag>().End();
         var playersPool = systems.GetWorld().GetPool<PlayerTag>();
         var gameObjectPool = systems.GetWorld().GetPool<GameObjectRef>();
+        var positionPool = systems.GetWorld().GetPool<Position>();
         var moveSpeedPool = systems.GetWorld().GetPool<MoveSpeed>();
         var destoryOnExitPool = systems.GetWorld().GetPool<DestroyOnExitTag>();
 
@@ -470,7 +657,8 @@ public class PlayerInitSystem : IEcsRunSystem, IEcsInitSystem
             gameObjectPool.Add(newPlayerEntity).GO = playerGO;
             moveSpeedPool.Add(newPlayerEntity).speed = 10;
             destoryOnExitPool.Add(newPlayerEntity);
-            playerGO.transform.position = new Vector3(systems.GetShared<SharedData>().savedPlayerXPosition, 0, 0);
+            positionPool.Add(newPlayerEntity).position =
+                new Vector3(systems.GetShared<SharedData>().savedPlayerXPosition, 0, 0);
             Debug.Log("Player was created!!!");
         }
     }
@@ -517,6 +705,11 @@ public struct MoveDirection
 public struct RotateAngle
 {
     public float angle;
+}
+
+public struct Position
+{
+    public Vector3 position;
 }
 
 public struct Velocity
@@ -605,6 +798,9 @@ public class GameManager : MonoBehaviour
             .Add(new DisplaySystem())
             .Add(new PlayerWinSystem())
             .Add(new GameObjectCleanUpSystem())
+            .Add(new SyncPositionWithUnitySystem())
+            .Add(new SaveSystem())
+            .Add(new BulletInitSystem())
             .Init();
     }
 

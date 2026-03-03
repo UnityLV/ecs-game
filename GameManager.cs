@@ -2,15 +2,119 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using Leopotam.EcsLite;
 using Newtonsoft.Json;
 using UnityEditor.Experimental.GraphView;
 using UnityEngine;
+using UnityEngine.AddressableAssets;
+using UnityEngine.ResourceManagement.AsyncOperations;
 using Object = UnityEngine.Object;
 using Random = System.Random;
 
-//система сохранения и загрузки, модель в ecs синкается с юнити
-//система асинхронной загрузки ассетов, моделей для игрока и патронов и препятсвий
+public class AssetLoadingSubSyster
+{
+    private static readonly string[] AssetAddresses = { "Player", "Bullet", "Obstacle" };
+    
+    private readonly Dictionary<string, AsyncOperationHandle<GameObject>> _handles = new();
+    private readonly Dictionary<string, GameObject> _loadedPrefabs = new();
+    
+    public void Init(IEcsSystems systems)
+    {
+        foreach (var address in AssetAddresses)
+        {
+            if (_handles.ContainsKey(address))
+                continue;
+            
+            var handle = Addressables.LoadAssetAsync<GameObject>(address);
+            _handles[address] = handle;
+            
+            handle.Completed += h =>
+            {
+                if (h.Status == AsyncOperationStatus.Succeeded)
+                {
+                    int time = (int)(UnityEngine.Random.Range(0.4f, 1f) * 1000);
+                    new Thread(() =>
+                    {
+                        Thread.Sleep(time);
+                        _loadedPrefabs[address] = h.Result;
+
+                    }).Start();
+                }
+                else
+                {
+                    Debug.LogError($"Asset load failed: {address}");
+                }
+            };
+        }
+    }
+    
+    public void Destroy(IEcsSystems systems)
+    {
+        foreach (var kvp in _handles)
+        {
+            if (kvp.Value.IsValid())
+            {
+                Addressables.Release(kvp.Value);
+            }
+        }
+        
+        _handles.Clear();
+        _loadedPrefabs.Clear();
+    }
+    
+
+    
+    public bool HasLoadedAsset(string address, out GameObject prefab)
+    {
+        return _loadedPrefabs.TryGetValue(address, out prefab);
+    }
+    
+
+}
+
+public class ModelLoadSystem : IEcsRunSystem,IEcsInitSystem,IEcsDestroySystem
+{
+    private AssetLoadingSubSyster assets = new();
+    
+    public void Init(IEcsSystems systems)
+    {
+        assets.Init(systems);
+    }
+
+    public void Run(IEcsSystems systems)
+    {
+        var world = systems.GetWorld();
+    
+        var needModel = world
+            .Filter<NeedAssetModel>()
+            .Inc<Position>()
+            .Exc<GameObjectRef>()
+            .End();
+        
+        var needModelPool = world.GetPool<NeedAssetModel>();
+        var positionPool = world.GetPool<Position>();
+        var gameObjectPool = world.GetPool<GameObjectRef>();
+        
+        foreach (var entity in needModel)
+        {
+            var address = needModelPool.Get(entity).Address;
+            
+            if (!assets.HasLoadedAsset(address, out var prefab))
+                continue;
+            
+            var position = positionPool.Get(entity).position;
+            var go = Object.Instantiate(prefab, position, Quaternion.identity);
+            gameObjectPool.Add(entity).GO = go;
+            needModelPool.Del(entity);
+        }
+    }
+
+    public void Destroy(IEcsSystems systems)
+    {
+        assets.Destroy(systems);
+    }
+}
 
 [Serializable]
 public struct SVector3
@@ -45,16 +149,12 @@ public class SaveSystem : IEcsInitSystem, IEcsDestroySystem
 
     public void Init(IEcsSystems systems)
     {
-        Debug.Log("SaveSystem: Init - Начинаем восстановление пуль");
         Restore(systems);
-        Debug.Log("SaveSystem: Init - Восстановление завершено");
     }
 
     public void Destroy(IEcsSystems systems)
     {
-        Debug.Log("SaveSystem: Destroy - Начинаем сохранение пуль");
         Save(systems);
-        Debug.Log("SaveSystem: Destroy - Сохранение завершено");
     }
 
     public void Restore(IEcsSystems systems)
@@ -318,8 +418,8 @@ public class BulletDestoryObstacleSystem : IEcsRunSystem
 {
     public void Run(IEcsSystems systems)
     {
-        var bulletFilter = systems.GetWorld().Filter<BulletTag>().Inc<Position>().End();
-        var obstacleFilter = systems.GetWorld().Filter<ObstacleTag>().Inc<Position>().End();
+        var bulletFilter = systems.GetWorld().Filter<BulletTag>().Inc<Position>().Inc<GameObjectLifeTime>().End();
+        var obstacleFilter = systems.GetWorld().Filter<ObstacleTag>().Inc<Position>().Inc<GameObjectLifeTime>().End();
         var obstalceDesotoryEventFilter = systems.GetWorld().Filter<ObstacleDestroyEvent>().End();
 
         var positionPool = systems.GetWorld().GetPool<Position>();
@@ -356,34 +456,27 @@ public class BulletDestoryObstacleSystem : IEcsRunSystem
 
 public class ObstacleSpawnSystem : IEcsRunSystem
 {
-    private float lastSpawnTime;
-    private float spawnInterval = 0.5f;
-
+    private float _lastSpawnTime;
+    private float _spawnInterval = 0.5f;
+    
     public void Run(IEcsSystems systems)
     {
-        float time = Time.time;
-        if (time - lastSpawnTime > spawnInterval)
-        {
-            lastSpawnTime = time;
-
-            var obstacleEntity = systems.GetWorld().NewEntity();
-
-            var velocityPool = systems.GetWorld().GetPool<Velocity>();
-            var gameObjectPool = systems.GetWorld().GetPool<GameObjectRef>();
-            var lifeTimePool = systems.GetWorld().GetPool<GameObjectLifeTime>();
-            var obstaclePool = systems.GetWorld().GetPool<ObstacleTag>();
-            var destroyOnExitPool = systems.GetWorld().GetPool<DestroyOnExitTag>();
-            var positionPool = systems.GetWorld().GetPool<Position>();
-
-            float xPos = (Mathf.PerlinNoise1D(time) - 0.5f) * 20;
-            gameObjectPool.Add(obstacleEntity).GO = GameObject.CreatePrimitive(PrimitiveType.Cube);
-
-            velocityPool.Add(obstacleEntity).direction = new Vector3(0, 0, -10);
-            lifeTimePool.Add(obstacleEntity).deadTime = Time.time + 5;
-            obstaclePool.Add(obstacleEntity);
-            destroyOnExitPool.Add(obstacleEntity);
-            positionPool.Add(obstacleEntity).position = new Vector3(xPos, 0, 30);
-        }
+        if (Time.time - _lastSpawnTime <= _spawnInterval) return;
+        _lastSpawnTime = Time.time;
+        
+        var world = systems.GetWorld();
+        
+        float xPos = (Mathf.PerlinNoise1D(Time.time) - 0.5f) * 20;
+        var position = new Vector3(xPos, 0, 30);
+        
+        var entity = world.NewEntity();
+        
+        world.GetPool<ObstacleTag>().Add(entity);
+        world.GetPool<Position>().Add(entity).position = position;
+        world.GetPool<Velocity>().Add(entity).direction = new Vector3(0, 0, -10);
+        world.GetPool<GameObjectLifeTime>().Add(entity).deadTime = Time.time + 5;
+        world.GetPool<DestroyOnExitTag>().Add(entity);
+        world.GetPool<NeedAssetModel>().Add(entity).Address = "Obstacle";
     }
 }
 
@@ -487,18 +580,25 @@ public class BulletInitSystem : IEcsRunSystem
 {
     public void Run(IEcsSystems systems)
     {
-        var toInitFilter = systems.GetWorld().Filter<BulletTag>().Inc<Position>().Inc<Velocity>().Exc<GameObjectRef>()
+        var world = systems.GetWorld();
+        
+        var filter = world.Filter<BulletTag>()
+            .Inc<Position>()
+            .Inc<Velocity>()
+            .Exc<GameObjectRef>()
+            .Exc<NeedAssetModel>()
             .End();
-
-        var gameObjectPool = systems.GetWorld().GetPool<GameObjectRef>();
-        var lifeTimePool = systems.GetWorld().GetPool<GameObjectLifeTime>();
-        var destroyOnExitPool = systems.GetWorld().GetPool<DestroyOnExitTag>();
-
-        foreach (var toInit in toInitFilter)
+        
+        var positionPool = world.GetPool<Position>();
+        var lifeTimePool = world.GetPool<GameObjectLifeTime>();
+        var destroyOnExitPool = world.GetPool<DestroyOnExitTag>();
+        var needModelPool = world.GetPool<NeedAssetModel>();
+        
+        foreach (var entity in filter)
         {
-            gameObjectPool.Add(toInit).GO = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            lifeTimePool.Add(toInit).deadTime = Time.time + 10;
-            destroyOnExitPool.Add(toInit);
+            lifeTimePool.Add(entity).deadTime = Time.time + 10;
+            destroyOnExitPool.Add(entity);
+            needModelPool.Add(entity).Address = "Bullet";
         }
     }
 }
@@ -512,13 +612,12 @@ public class FireSystem : IEcsRunSystem
         var bulletPool = systems.GetWorld().GetPool<BulletTag>();
         var velocityPool = systems.GetWorld().GetPool<Velocity>();
         var positionPool = systems.GetWorld().GetPool<Position>();
-        var gameObjectPool = systems.GetWorld().GetPool<GameObjectRef>();
 
         foreach (var player in firePlayer)
         {
             var bullet = systems.GetWorld().NewEntity();
             bulletPool.Add(bullet);
-            velocityPool.Add(bullet).direction = gameObjectPool.Get(player).GO.transform.forward * 10;
+            velocityPool.Add(bullet).direction = Vector3.forward * 10;
             positionPool.Add(bullet).position = positionPool.Get(player).position;
         }
     }
@@ -637,37 +736,30 @@ public class InputSystem : IEcsRunSystem, IEcsInitSystem
     }
 }
 
-public class PlayerInitSystem : IEcsRunSystem, IEcsInitSystem
+public class PlayerInitSystem : IEcsInitSystem
 {
     public void Init(IEcsSystems systems)
     {
-        var playersFilter = systems.GetWorld().Filter<PlayerTag>().End();
-        var playersPool = systems.GetWorld().GetPool<PlayerTag>();
-        var gameObjectPool = systems.GetWorld().GetPool<GameObjectRef>();
-        var positionPool = systems.GetWorld().GetPool<Position>();
-        var moveSpeedPool = systems.GetWorld().GetPool<MoveSpeed>();
-        var destoryOnExitPool = systems.GetWorld().GetPool<DestroyOnExitTag>();
-
-        if (playersFilter.GetEntitiesCount() == 0)
-        {
-            //crate new player entity
-            var newPlayerEntity = systems.GetWorld().NewEntity();
-            GameObject playerGO = GameObject.CreatePrimitive(PrimitiveType.Capsule);
-            playersPool.Add(newPlayerEntity);
-            gameObjectPool.Add(newPlayerEntity).GO = playerGO;
-            moveSpeedPool.Add(newPlayerEntity).speed = 10;
-            destoryOnExitPool.Add(newPlayerEntity);
-            positionPool.Add(newPlayerEntity).position =
-                new Vector3(systems.GetShared<SharedData>().savedPlayerXPosition, 0, 0);
-            Debug.Log("Player was created!!!");
-        }
-    }
-
-    public void Run(IEcsSystems systems)
-    {
+        var world = systems.GetWorld();
+        var shared = systems.GetShared<SharedData>();
+        
+        if (world.Filter<PlayerTag>().End().GetEntitiesCount() > 0)
+            return;
+        
+        var entity = world.NewEntity();
+        
+        world.GetPool<PlayerTag>().Add(entity);
+        world.GetPool<Position>().Add(entity).position = new Vector3(shared.savedPlayerXPosition, 0, 0);
+        world.GetPool<MoveSpeed>().Add(entity).speed = 10;
+        world.GetPool<DestroyOnExitTag>().Add(entity);
+        world.GetPool<NeedAssetModel>().Add(entity).Address = "Player";
     }
 }
 
+public struct NeedAssetModel
+{
+    public string Address;
+}
 
 public struct FollowPlayer
 {
@@ -801,6 +893,7 @@ public class GameManager : MonoBehaviour
             .Add(new SyncPositionWithUnitySystem())
             .Add(new SaveSystem())
             .Add(new BulletInitSystem())
+            .Add(new ModelLoadSystem())
             .Init();
     }
 
